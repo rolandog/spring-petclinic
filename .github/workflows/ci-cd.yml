@@ -15,7 +15,7 @@ concurrency:
 
 env:
   JAVA_VERSION: '21'
-  SONAR_PROJECT_KEY: Spring-PetClinic   # must match the project in SonarQube
+  SONAR_PROJECT_KEY: rg-petclinic   # must match the project in SonarQube
 
 jobs:
   build:
