@@ -1,0 +1,120 @@
+name: Java CI/CD Pipeline with Maven
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  JAVA_VERSION: '21'
+  SONAR_PROJECT_KEY: Spring-PetClinic   # must match the project in SonarQube
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0              # full history for sonar blame/new code
+          persist-credentials: false  # the token isn't needed after checkout
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }} (Eclipse Temurin, OpenJDK)
+        uses: actions/setup-java@v6
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven                # also caches the wrapper and the JDK
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Cache SonarQube packages
+        if: github.event_name == 'push'
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Grant execute permission for Maven wrapper
+        run: chmod +x mvnw
+
+      # PRs: build and test only (no secrets on fork PRs; no PR analysis on Community Build)
+      - name: Build and test
+        if: github.event_name == 'pull_request'
+        run: ./mvnw -B verify
+
+      # push to main: build, test and analyse in one Maven run
+      - name: Build, test and analyze
+        if: github.event_name == 'push'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: >
+          ./mvnw -B verify
+          org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
+          -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+          -Dsonar.projectName='${{ env.SONAR_PROJECT_KEY }}'
+          # add -Dsonar.qualitygate.wait=true to block deploys on a red gate
+
+      - name: Archive production jar
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: spring-petclinic-jar
+          path: target/spring-petclinic-*.jar
+          if-no-files-found: error
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 15
+    concurrency:
+      group: deploy-ec2
+      cancel-in-progress: false
+    env:
+      SSH_OPTS: -o StrictHostKeyChecking=accept-new
+      TARGET: admin@${{ secrets.EC2_HOST }}
+
+    steps:
+      - name: Download jar from CI
+        uses: actions/download-artifact@v8
+        with:
+          name: spring-petclinic-jar
+          path: target
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_PRIVATE_KEY }}
+
+      - name: Copy jar to EC2
+        run: scp $SSH_OPTS target/spring-petclinic-*.jar "$TARGET:/tmp/petclinic.jar"
+
+      - name: Install jar and restart service
+        run: |
+          ssh $SSH_OPTS "$TARGET" \
+            'sudo install -o root -g root -m 0644 /tmp/petclinic.jar /opt/petclinic/petclinic.jar \
+             && rm -f /tmp/petclinic.jar \
+             && sudo systemctl restart petclinic'
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' \
+                 "http://${{ secrets.EC2_HOST }}:8080/"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'error: petclinic did not answer on :8080' >&2
+          ssh $SSH_OPTS "$TARGET" 'sudo journalctl -u petclinic -n 50 --no-pager'
+          exit 1
